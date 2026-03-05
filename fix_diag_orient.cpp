@@ -1,7 +1,8 @@
+// clang-format off
 /* ----------------------------------------------------------------------
    LAMMPS - Large-scale Atomic/Molecular Massively Parallel Simulator
-   http://lammps.sandia.gov, Sandia National Laboratories
-   Steve Plimpton, sjplimp@sandia.gov
+   https://www.lammps.org/, Sandia National Laboratories
+   LAMMPS development team: developers@lammps.org
 
    Copyright (2003) Sandia Corporation.  Under the terms of Contract
    DE-AC04-94AL85000 with Sandia Corporation, the U.S. Government retains
@@ -11,8 +12,16 @@
    See the README file in the top-level LAMMPS directory.
 ------------------------------------------------------------------------- */
 
+/* ----------------------------------------------------------------------
+   Contributing authors: Lingti Kong (SJTU)
+   Customized fix to diagnose the orientation of molecules based on the
+   vector that connects the 1-2 of bond, 1-3 of angle, or 1-4 of dihedras.
+------------------------------------------------------------------------- */
+
 #include "fix_diag_orient.h"
+
 #include "atom.h"
+#include "citeme.h"
 #include "neighbor.h"
 #include "domain.h"
 #include "update.h"
@@ -20,6 +29,7 @@
 #include "comm.h"
 #include "memory.h"
 #include "mpi.h"
+#include "utils.h"
 
 #include "string.h"
 #include "math.h"
@@ -29,9 +39,21 @@
 using namespace LAMMPS_NS;
 using namespace FixConst;
 
+static const char cite_fix_diag_orient[] =
+  "fix diag/orient command: https://doi.org/10.1016/j.commatsci.2016.02.016\n\n"
+  "@Article{Wicaksono16,\n"
+  "  author = {A. T. Wicaksono and C. W. Sinclair and M. Militzer},\n"
+  "  title = {An Atomistic Study of the Correlation Between the Migration\n"
+  "    of Planar and Curved Grain Boundaries},\n"
+  "  journal = {Computational Materials Science},\n"
+  "  year =    2016,\n"
+  "  volume =  117,\n"
+  "  pages =   {397--405}\n"
+  "}\n\n";
+
 /* ---------------------------------------------------------------------- */
 
-DiagOrientation::DiagOrientation(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg, arg)
+FixDiagOrient::FixDiagOrient(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg, arg), prefix(nullptr)
 {
   // sample inputfile call: //
   // fix  ID g-ID orient nevery orient_base type_id prefix noutput xbin ybin zbin flag [qsum]
@@ -51,55 +73,60 @@ DiagOrientation::DiagOrientation(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, n
   // qsum: if presented, the total charge on atoms in selected bond, angle, or dihedral should be this number,
   //       otherwise the bond, angle or dihedral will not be used to evaluate orientation
 
-  if (narg < 12) error->all(FLERR,"Illegal orientation command");
+
+  if (lmp->citeme) lmp->citeme->add(cite_fix_diag_orient);
 
   MPI_Comm_rank(world,&me);
 
-  nevery = atoi(arg[3]);
-  orient_base = atoi(arg[4]);
+  if (narg < 12) error->all(FLERR,"Illegal orientation command");
+
+  nevery = utils::inumeric(FLERR, arg[3], false, lmp);
+  orient_base = utils::inumeric(FLERR, arg[4], false, lmp);
   if (orient_base < 2 || orient_base > 4) error->all(FLERR, "Orient_base can only be 2 (bond), 3 (angle), or 4 (dihedral)");
-  id_type = atoi(arg[5]);
+
+  id_type = utils::inumeric(FLERR, arg[5], false, lmp);
   if (orient_base == 2){
     if (id_type < 1 || id_type > atom->nbondtypes) error->all(FLERR, "Wrong bond type!");
+
   } else if (orient_base == 3){
     if (id_type < 1 || id_type > atom->nangletypes) error->all(FLERR, "Wrong angle type!");
+
   } else {
     if (id_type < 1 || id_type > atom->ndihedraltypes) error->all(FLERR, "Wrong dihedral type!");
   }
 
-  int n = strlen(arg[6])+1;
-  prefix = new char[n];
-  strcpy(prefix, arg[6]);
+  prefix = utils::strdup(arg[6]);
+  noutput = utils::inumeric(FLERR, arg[7], false, lmp);
 
-  noutput = atoi(arg[7]);
+  Nbx = utils::inumeric(FLERR, arg[8], false, lmp);
+  Nby = utils::inumeric(FLERR, arg[9], false, lmp);
+  Nbz = utils::inumeric(FLERR, arg[10], false, lmp);
 
-  Nbx = atoi(arg[8]);
-  Nby = atoi(arg[9]);
-  Nbz = atoi(arg[10]);
-
-  restartflg = atoi(arg[11]);
+  restartflg = utils::inumeric(FLERR, arg[11], false, lmp);
 
   checkchg = 0;
   if (narg == 13){
      checkchg = 1;
-     qref = atof(arg[12]);
+     qref = utils::numeric(FLERR, arg[12], false, lmp);
   }
 
   first = 1;
+
   // enabled to output a global vector of size 6
+  scalar_flag = 0;
   vector_flag = 1;
   size_vector = 6;
   global_freq = nevery;
-  //extvector = 1;
 
 }
 
-DiagOrientation::~DiagOrientation()
+FixDiagOrient::~FixDiagOrient()
 {
-  free(altogether);
+  delete []prefix;
+  memory->destroy(altogether);
 }
 
-int DiagOrientation::setmask()
+int FixDiagOrient::setmask()
 {
   int mask = 0;
   mask |= END_OF_STEP;
@@ -107,8 +134,7 @@ int DiagOrientation::setmask()
 }
 
 
-
-void DiagOrientation::init()
+void FixDiagOrient::init()
 {
 
   if (first != 1) return;
@@ -116,9 +142,9 @@ void DiagOrientation::init()
 
 #define EPSILON (1.e-10)
 
-  subNbx=(int)ceil(((double) Nbx)/((double) comm->procgrid[0]))+12;
-  subNby=(int)ceil(((double) Nby)/((double) comm->procgrid[1]))+12;
-  subNbz=(int)ceil(((double) Nbz)/((double) comm->procgrid[2]))+12;
+  subNbx = (int)ceil(((double) Nbx)/((double) comm->procgrid[0]))+12;
+  subNby = (int)ceil(((double) Nby)/((double) comm->procgrid[1]))+12;
+  subNbz = (int)ceil(((double) Nbz)/((double) comm->procgrid[2]))+12;
   
   sublosft[0]=domain->boxlo[0]+(double)
     ((int)((domain->sublo[0]-domain->boxlo[0])/(domain->xprd)*Nbx)-6)*
@@ -134,8 +160,8 @@ void DiagOrientation::init()
   subsize[1]=(domain->yprd)*(subNby)/Nby;
   subsize[2]=(domain->zprd)*(subNbz)/Nbz;
 
-  //altogether = memory->create_2d_double_array(subNbx*subNby*subNbz*10+10, 10, "fix_orientation:altogether");
-  altogether = (double (*)[10])calloc((size_t)(subNbx*subNby*subNbz*10+10), sizeof(double));
+  altogether = memory->create(altogether, subNbx*subNby*subNbz*10+10, 10, "fix_diag_orient:altogether");
+  //altogether = (double (*)[10])calloc((size_t)(subNbx*subNby*subNbz*10+10), sizeof(double));
   if (altogether == NULL) error->one(FLERR,"Could not allocate density data\n");
 
   for (int i=0; i< subNbx*subNby*subNbz; i++){
@@ -174,7 +200,7 @@ void DiagOrientation::init()
 }
 
 
-void DiagOrientation::end_of_step()
+void FixDiagOrient::end_of_step()
 {
   double **x = atom->x;
   double  *q = atom->q;
@@ -209,7 +235,7 @@ void DiagOrientation::end_of_step()
         delx = x[i1][0] - x[i2][0];
         dely = x[i1][1] - x[i2][1];
         delz = x[i1][2] - x[i2][2];
-        domain->minimum_image(delx,dely,delz);
+        domain->minimum_image(FLERR, delx,dely,delz);
 
         rsq = delx*delx + dely*dely + delz*delz;
         rsq = 1./ rsq;
@@ -266,7 +292,7 @@ void DiagOrientation::end_of_step()
         delx = x[i1][0] - x[i3][0];
         dely = x[i1][1] - x[i3][1];
         delz = x[i1][2] - x[i3][2];
-        domain->minimum_image(delx,dely,delz);
+        domain->minimum_image(FLERR, delx,dely,delz);
 
         rsq = delx*delx + dely*dely + delz*delz;
         rsq = 1./ rsq;
@@ -321,7 +347,7 @@ void DiagOrientation::end_of_step()
         delx = x[i1][0] - x[i4][0];
         dely = x[i1][1] - x[i4][1];
         delz = x[i1][2] - x[i4][2];
-        domain->minimum_image(delx,dely,delz);
+        domain->minimum_image(FLERR, delx,dely,delz);
 
         rsq = delx*delx + dely*dely + delz*delz;
         rsq = 1./ rsq;
@@ -373,17 +399,21 @@ void DiagOrientation::end_of_step()
     // get size for communication buffer
     int local_size=subNbx*subNby*subNbz*10+10, local_max, recv_size;
     int i, j, k;
-    double (*buf)[10],(*dbuf)[10],(*fullset)[10], *tmp;
+    //double (*buf)[10],(*dbuf)[10],(*fullset)[10], *tmp;
+    double **buf, **dbuf, **fullset, *tmp;
+
     MPI_Status status;
     MPI_Request request;
 
     MPI_Allreduce(&local_size,&local_max,1,MPI_INT,MPI_MAX,world);
 
     if (me==0) {
-      buf = (double (*)[10]) memory->smalloc(local_max*sizeof(double),
-				       "orientation:buf");
+      //buf = (double (*)[10]) memory->smalloc(local_max*sizeof(double),
+		//		       "orientation:buf");
+      buf = memory->create(buf, local_max, 10, "FixDiagOrient:buf");
+      fullset = memory->create(fullset, Nbx*Nby*Nbz*10, 10, "FixDiagOrient:fullset");
 
-      fullset =(double (*)[10])calloc((size_t)(Nbx*Nby*Nbz*10),sizeof(double));
+      //fullset =(double (*)[10])calloc((size_t)(Nbx*Nby*Nbz*10),sizeof(double));
       if (fullset == NULL) error->one(FLERR,"Could not allocate fullset data\n");
       // in future, will set up random access temporary file to write data
       // to in place of fullset when there is not enough memory.
@@ -433,7 +463,7 @@ void DiagOrientation::end_of_step()
        char outfile[128];
        FILE *outfilefp;
 
-      sprintf(outfile,"%s."BIGINT_FORMAT,prefix,update->ntimestep);
+      sprintf(outfile,"%s." BIGINT_FORMAT,prefix,update->ntimestep);
       outfilefp= fopen(outfile,"w");
       if (outfilefp == NULL) error->one(FLERR,"Could not open density file\n");
       
@@ -447,7 +477,8 @@ void DiagOrientation::end_of_step()
 	fprintf(outfilefp,"\n");
       }
       
-      free(fullset);
+      memory->destroy(buf);
+      memory->destroy(fullset);
       fclose(outfilefp);
     }
     
@@ -461,7 +492,7 @@ void DiagOrientation::end_of_step()
   
 }
 
-double DiagOrientation::compute_vector(int n)
+double FixDiagOrient::compute_vector(int n)
 {
   // only sum across procs one time
 
@@ -475,4 +506,14 @@ double DiagOrientation::compute_vector(int n)
   }
 
   return vector_all[n+1];
+}
+
+/* ----------------------------------------------------------------------
+   memory usage of local atom-based arrays
+------------------------------------------------------------------------- */
+
+double FixDiagOrient::memory_usage()
+{
+  double bytes = sizeof(altogether);
+  return bytes;
 }
