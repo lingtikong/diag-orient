@@ -41,12 +41,12 @@ class FixDiagOrient : public Fix {
 
  private:
   int me, nprocs, first;
-  int orient_base, id_type;
+  int id_type;
   int noutput;
   int checkchg;
   double qref;
 
-  char *prefix;
+  char *base, *prefix;
 
   int Nbx,Nby,Nbz,restartflg;
 

@@ -56,11 +56,11 @@ static const char cite_fix_diag_orient[] =
 FixDiagOrient::FixDiagOrient(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg, arg), prefix(nullptr)
 {
   // sample inputfile call: //
-  // fix  ID g-ID orient nevery orient_base type_id prefix noutput xbin ybin zbin flag [qsum]
+  // fix  ID g-ID orient nevery base type_id prefix noutput xbin ybin zbin flag [qsum]
   // where
   // ID, g-ID is as other fix
   // nevery is the frequency to measure orientation
-  // orient_base indicate the orientation is measured according to a bond (2),a angle (3) or a dihedral (4)
+  // base indicate the orientation is measured according to a bond (b),a angle (a) or a dihedral (d)
   // type_id is the id of the bond type or angle type or dihedral type used to measure orientation
   //         For bond, the unit vector pointing from 1 to 2 is used; for angle, the unit vector pointing from
   //         1 to 3 is used; for dihedral, the unit vector pointing from 1 to 4 is used.
@@ -81,18 +81,19 @@ FixDiagOrient::FixDiagOrient(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg,
   if (narg < 12) error->all(FLERR,"Illegal orientation command");
 
   nevery = utils::inumeric(FLERR, arg[3], false, lmp);
-  orient_base = utils::inumeric(FLERR, arg[4], false, lmp);
-  if (orient_base < 2 || orient_base > 4) error->all(FLERR, "Orient_base can only be 2 (bond), 3 (angle), or 4 (dihedral)");
-
+  base = utils::strdup(arg[4]);
   id_type = utils::inumeric(FLERR, arg[5], false, lmp);
-  if (orient_base == 2){
+  if (utils::strsame(base, "b")){
     if (id_type < 1 || id_type > atom->nbondtypes) error->all(FLERR, "Wrong bond type!");
 
-  } else if (orient_base == 3){
+  } else if (utils::strsame(base, "a")){
     if (id_type < 1 || id_type > atom->nangletypes) error->all(FLERR, "Wrong angle type!");
 
-  } else {
+  } else if (utils::strsame(base, "d")){
     if (id_type < 1 || id_type > atom->ndihedraltypes) error->all(FLERR, "Wrong dihedral type!");
+
+  } else {
+    error->all(FLERR, "base must be b (bond), a (angle), or d (dihedral)");
   }
 
   prefix = utils::strdup(arg[6]);
@@ -122,6 +123,7 @@ FixDiagOrient::FixDiagOrient(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg,
 
 FixDiagOrient::~FixDiagOrient()
 {
+  delete []base;
   delete []prefix;
   memory->destroy(altogether);
 }
@@ -221,7 +223,7 @@ void FixDiagOrient::end_of_step()
   cv_flag = 0;
   for (int i = 0; i < 7; ++i) vector_all[i] = vector_me[i] = 0.;
 
-  if (orient_base == 2){ // orientation based on bond
+  if (utils::strsame(base, "b")){ // orientation based on bond
     for (n = 0; n < nbondlist; n++) {
       if (bondlist[n][2] == id_type){
         i1 = bondlist[n][0];
@@ -277,7 +279,7 @@ void FixDiagOrient::end_of_step()
         vector_me[6] += dely*delz;
       }
     }
-  } else if (orient_base == 3) { // orientation based on angle
+  } else if (utils::strsame(base, "a")) { // orientation based on angle
     for (n = 0; n < nanglelist; n++) {
       if (anglelist[n][3] == id_type){
         i1 = anglelist[n][0];
@@ -331,7 +333,7 @@ void FixDiagOrient::end_of_step()
         vector_me[6] += dely*delz;
       }
     }
-  } else if (orient_base == 4) { // orientation based on dihedral
+  } else if (utils::strsame(base, "d")) { // orientation based on dihedral
     for (n = 0; n < ndihedrallist; n++) {
       if (dihedrallist[n][4] == id_type){
         i1 = dihedrallist[n][0];
